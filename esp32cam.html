@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>ESP32CAM-CÓDIGO</title>
+
+<link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" rel="stylesheet"/>
+
+<style>
+body{
+    margin:0;
+    background:#f5f5f5;
+    font-family:Arial,Helvetica,sans-serif;
+}
+
+header{
+    background:#fff;
+    text-align:center;
+    padding:20px;
+    box-shadow:0 2px 10px rgba(0,0,0,.1);
+}
+
+header img{
+    width:100%;
+    max-width:1400px;
+    height:auto;
+}
+
+.container{
+    width:95%;
+    margin:30px auto;
+}
+
+h1{
+    text-align:center;
+}
+
+pre{
+    border-radius:10px;
+    font-size:14px;
+}
+</style>
+
+</head>
+<body>
+
+<header>
+    <img src="logo.png">
+</header>
+
+<div class="container">
+
+<h1>ESP32-CÓDIGO</h1>
+
+<pre><code class="language-cpp">
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+const char* WIFI_SSID = "WIFI";
+const char* WIFI_PASS = "PASS";
+
+const char* TELEGRAM_TOKEN   = "TOKEN-TELEGRAM";
+const char* TELEGRAM_CHAT_ID = "CHAT-ID";
+
+#define PIN_AVISO  13
+#define PIN_RESP_A 12
+#define PIN_RESP_B  2
+
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM   0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM     5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+const float UMBRAL_PORCENTAJE = 8.0;
+const int   UMBRAL_PIXELES_MIN = 10;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_AVISO,  INPUT);
+  pinMode(PIN_RESP_A, OUTPUT);
+  pinMode(PIN_RESP_B, OUTPUT);
+  digitalWrite(PIN_RESP_A, LOW);
+  digitalWrite(PIN_RESP_B, LOW);
+
+  conectarWiFi();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0=Y2_GPIO_NUM; config.pin_d1=Y3_GPIO_NUM;
+  config.pin_d2=Y4_GPIO_NUM; config.pin_d3=Y5_GPIO_NUM;
+  config.pin_d4=Y6_GPIO_NUM; config.pin_d5=Y7_GPIO_NUM;
+  config.pin_d6=Y8_GPIO_NUM; config.pin_d7=Y9_GPIO_NUM;
+  config.pin_xclk=XCLK_GPIO_NUM; config.pin_pclk=PCLK_GPIO_NUM;
+  config.pin_vsync=VSYNC_GPIO_NUM; config.pin_href=HREF_GPIO_NUM;
+  config.pin_sccb_sda=SIOD_GPIO_NUM; config.pin_sccb_scl=SIOC_GPIO_NUM;
+  config.pin_pwdn=PWDN_GPIO_NUM; config.pin_reset=RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size   = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Error iniciando cámara");
+    return;
+  }
+  Serial.println("ESP32-CAM lista.");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) conectarWiFi();
+
+  if (digitalRead(PIN_AVISO) == HIGH) {
+    Serial.println("Aviso recibido, analizando...");
+
+    float porcentaje;
+    int direccion; // 0=no fuego, 1=centrado, 2=izquierda, 3=derecha
+    analizarColorYPosicion(porcentaje, direccion);
+
+    Serial.printf("%.1f%% fuego, dirección=%d\n", porcentaje, direccion);
+
+    switch (direccion) {
+      case 0: // no hay fuego
+        digitalWrite(PIN_RESP_A, LOW);
+        digitalWrite(PIN_RESP_B, LOW);
+        break;
+      case 1: // centrado
+        digitalWrite(PIN_RESP_A, HIGH);
+        digitalWrite(PIN_RESP_B, LOW);
+        break;
+      case 2: // izquierda
+        digitalWrite(PIN_RESP_A, LOW);
+        digitalWrite(PIN_RESP_B, HIGH);
+        break;
+      case 3: // derecha
+        digitalWrite(PIN_RESP_A, HIGH);
+        digitalWrite(PIN_RESP_B, HIGH);
+        break;
+    }
+
+    unsigned long t = millis();
+    while (digitalRead(PIN_AVISO) == HIGH && millis() - t < 15000) {
+      delay(50);
+    }
+
+    digitalWrite(PIN_RESP_A, LOW);
+    digitalWrite(PIN_RESP_B, LOW);
+
+    if (direccion > 0) {
+      String msg = (direccion == 1)
+        ? "🔥 FUEGO CONFIRMADO y centrado (" + String(porcentaje, 1) + "% píxeles)"
+        : "🔥 FUEGO DETECTADO - ajustando posición (" + String(porcentaje, 1) + "% píxeles)";
+
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) {
+        enviarFotoTelegram(fb, msg);
+        esp_camera_fb_return(fb);
+      }
+    } else {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) {
+        enviarFotoTelegram(fb, "✅ No se confirma fuego (" + String(porcentaje, 1) + "% píxeles)");
+        esp_camera_fb_return(fb);
+      }
+    }
+  }
+  delay(50);
+}
+
+void analizarColorYPosicion(float &porcentaje, int &direccion) {
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_pixformat(s, PIXFORMAT_RGB565);
+  s->set_framesize(s, FRAMESIZE_QQVGA);
+  delay(100);
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  porcentaje = 0;
+  direccion  = 0;
+
+  if (fb) {
+    int total  = fb->width * fb->height;
+    int fuego  = 0;
+    long sumaX = 0;
+    uint16_t *buf = (uint16_t *)fb->buf;
+
+    for (int i = 0; i < total; i++) {
+      uint16_t p = buf[i];
+      uint8_t r8 = ((p >> 11) & 0x1F) << 3;
+      uint8_t g8 = ((p >> 5)  & 0x3F) << 2;
+      uint8_t b8 = (p & 0x1F) << 3;
+
+      if (r8 > 150 && b8 < 100 && r8 > g8 && g8 > b8) {
+        fuego++;
+        sumaX += (i % fb->width);
+      }
+    }
+
+    porcentaje = (100.0 * fuego) / total;
+
+    if (fuego >= UMBRAL_PIXELES_MIN && porcentaje >= UMBRAL_PORCENTAJE) {
+      int centroX   = sumaX / fuego;
+      int tercioIzq = fb->width / 3;
+      int tercioDer = fb->width * 2 / 3;
+
+      if (centroX < tercioIzq)
+      else if (centroX > tercioDer)
+      else
+    }
+
+    esp_camera_fb_return(fb);
+  }
+
+  s->set_pixformat(s, PIXFORMAT_JPEG);
+  s->set_framesize(s, FRAMESIZE_VGA);
+  delay(100);
+}
+
+void enviarFotoTelegram(camera_fb_t *fb, const String &caption) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "https://api.telegram.org/bot" + String(TELEGRAM_TOKEN) + "/sendPhoto";
+  String boundary = "ESP32CAMBoundary";
+  String ini = "--" + boundary + "\r\n";
+  ini += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+  ini += String(TELEGRAM_CHAT_ID) + "\r\n";
+  ini += "--" + boundary + "\r\n";
+  ini += "Content-Disposition: form-data; name=\"caption\"\r\n\r\n";
+  ini += caption + "\r\n";
+  ini += "--" + boundary + "\r\n";
+  ini += "Content-Disposition: form-data; name=\"photo\"; filename=\"foto.jpg\"\r\n";
+  ini += "Content-Type: image/jpeg\r\n\r\n";
+  String fin = "\r\n--" + boundary + "--\r\n";
+  size_t len = ini.length() + fb->len + fin.length();
+  http.begin(url);
+  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  uint8_t *buf = (uint8_t *)malloc(len);
+  if (!buf) { http.end(); return; }
+  size_t pos = 0;
+  memcpy(buf+pos, ini.c_str(), ini.length()); pos += ini.length();
+  memcpy(buf+pos, fb->buf, fb->len);          pos += fb->len;
+  memcpy(buf+pos, fin.c_str(), fin.length());
+  Serial.printf("Telegram: %d\n", http.POST(buf, len));
+  free(buf);
+  http.end();
+}
+
+void conectarWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 10000) {
+    delay(300); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+  else
+    Serial.println("\nSin WiFi.");
+}</code></pre>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+
+</body>
+</html>
