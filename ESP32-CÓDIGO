@@ -1,0 +1,246 @@
+#include <WiFi.h>
+
+#define IN1 17
+#define IN2 5
+#define IN3 18
+#define IN4 19
+#define SENSOR_IZQ     34
+#define SENSOR_MED     32
+#define SENSOR_DER     35
+#define BOMBA_PIN      26
+#define PIN_AVISO_CAM  27
+#define PIN_RESP_A     14
+#define PIN_RESP_B     13
+
+const char* WIFI_SSID = "WIFI";
+const char* WIFI_PASS = "PASS";
+
+const char* ZABBIX_IP   = "IP_SERVIDOR";
+const int   ZABBIX_PORT = 10052;
+const char* ZABBIX_HOST = "SCAI apagafuegos";
+
+int ultimoLado = 0;
+unsigned long inicioCiego = 0;
+bool girandoCiego = false;
+const unsigned long TIEMPO_MAX_CIEGO = 2000;
+
+unsigned long ultimoEnvioZabbix = 0;
+const unsigned long INTERVALO_ZABBIX = 5000;
+
+int  estadoBomba     = 0;
+int  fuegoConfirmado = 0;
+String ladoDetectado = "ninguno";
+unsigned long tiempoInicio = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(BOMBA_PIN, OUTPUT);
+  pinMode(SENSOR_IZQ, INPUT_PULLUP);
+  pinMode(SENSOR_MED, INPUT_PULLUP);
+  pinMode(SENSOR_DER, INPUT_PULLUP);
+  pinMode(PIN_AVISO_CAM, OUTPUT);
+  pinMode(PIN_RESP_A, INPUT);
+  pinMode(PIN_RESP_B, INPUT);
+  digitalWrite(PIN_AVISO_CAM, LOW);
+
+  detener();
+  digitalWrite(BOMBA_PIN, LOW);
+
+  conectarWiFi();
+  tiempoInicio = millis();
+  Serial.println("Listo.");
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) conectarWiFi();
+
+  bool llamaIzq = (digitalRead(SENSOR_IZQ) == LOW);
+  bool llamaMed = (digitalRead(SENSOR_MED) == LOW);
+  bool llamaDer = (digitalRead(SENSOR_DER) == LOW);
+
+  Serial.printf("Izq:%d  Med:%d  Der:%d\n", llamaIzq, llamaMed, llamaDer);
+
+  if      (llamaIzq && !llamaDer) ladoDetectado = "izquierda";
+  else if (llamaDer && !llamaIzq) ladoDetectado = "derecha";
+  else if (llamaMed)              ladoDetectado = "centro";
+  else                            ladoDetectado = "ninguno";
+
+  if (llamaMed && !llamaIzq && !llamaDer) {
+    detener();
+    bool centrado = false;
+    int intentos = 0;
+    const int MAX_INTENTOS = 6; // máximo 6 ajustes antes de rendirse
+
+    while (!centrado && intentos < MAX_INTENTOS) {
+      intentos++;
+      Serial.printf("Consulta CAM intento %d...\n", intentos);
+
+      digitalWrite(PIN_AVISO_CAM, HIGH);
+      delay(600);
+
+      bool pinA = digitalRead(PIN_RESP_A);
+      bool pinB = digitalRead(PIN_RESP_B);
+      digitalWrite(PIN_AVISO_CAM, LOW);
+
+      Serial.printf("PinA:%d PinB:%d\n", pinA, pinB);
+
+      if (!pinA && !pinB) {
+        // No hay fuego
+        Serial.println("CAM: no hay fuego.");
+        fuegoConfirmado = 0;
+        enviarZabbix();
+        ultimoLado = 0;
+        girandoCiego = false;
+        ladoDetectado = "ninguno";
+        return;
+
+      } else if (pinA && !pinB) {
+        Serial.println("CAM: fuego centrado. Avanzando.");
+        centrado = true;
+
+      } else if (!pinA && pinB) {
+        Serial.println("CAM: fuego a la izquierda. Ajustando.");
+        girarIzquierda();
+        delay(150);
+        detener();
+        delay(100);
+
+      } else if (pinA && pinB) {
+        Serial.println("CAM: fuego a la derecha. Ajustando.");
+        girarDerecha();
+        delay(150);
+        detener();
+        delay(100);
+      }
+    }
+
+    if (centrado) {
+      avanzar();
+      delay(1000);
+      detener();
+
+      fuegoConfirmado = 1;
+      estadoBomba     = 1;
+      enviarZabbix();
+      activarBomba();
+      delay(3000);
+      apagarBomba();
+      estadoBomba     = 0;
+      fuegoConfirmado = 0;
+      enviarZabbix();
+    } else {
+      Serial.println("No se pudo centrar tras varios intentos.");
+      fuegoConfirmado = 0;
+      enviarZabbix();
+    }
+
+    ultimoLado    = 0;
+    girandoCiego  = false;
+    ladoDetectado = "ninguno";
+    return;
+  }
+
+  apagarBomba();
+  estadoBomba = 0;
+
+  if (!llamaIzq && !llamaMed && !llamaDer) {
+    if (ultimoLado != 0) {
+      if (!girandoCiego) {
+        girandoCiego = true;
+        inicioCiego  = millis();
+      }
+      if (millis() - inicioCiego < TIEMPO_MAX_CIEGO) {
+        if (ultimoLado == -1) girarIzquierda();
+        else                  girarDerecha();
+      } else {
+        detener();
+        ultimoLado   = 0;
+        girandoCiego = false;
+      }
+    } else {
+      detener();
+    }
+  }
+  else if (llamaIzq && !llamaDer) {
+    girarIzquierda();
+    ultimoLado   = -1;
+    girandoCiego = false;
+  }
+  else if (llamaDer && !llamaIzq) {
+    girarDerecha();
+    ultimoLado   = 1;
+    girandoCiego = false;
+  }
+  else if (llamaIzq && llamaDer) {
+    avanzar();
+    ultimoLado   = 0;
+    girandoCiego = false;
+  }
+  else {
+    detener();
+  }
+
+  if (millis() - ultimoEnvioZabbix >= INTERVALO_ZABBIX) {
+    enviarZabbix();
+    ultimoEnvioZabbix = millis();
+  }
+
+  delay(50);
+}
+
+void enviarZabbix() {
+  WiFiClient cliente;
+  if (!cliente.connect(ZABBIX_IP, ZABBIX_PORT)) {
+    Serial.println("No se pudo conectar a Zabbix.");
+    return;
+  }
+  unsigned long uptime = (millis() - tiempoInicio) / 1000;
+  String datos = "[";
+  datos += "{\"host\":\"" + String(ZABBIX_HOST) + "\",\"key\":\"estado_bomba\",\"value\":\"" + String(estadoBomba) + "\"},";
+  datos += "{\"host\":\"" + String(ZABBIX_HOST) + "\",\"key\":\"fuego_confirmado\",\"value\":\"" + String(fuegoConfirmado) + "\"},";
+  datos += "{\"host\":\"" + String(ZABBIX_HOST) + "\",\"key\":\"lado_detectado\",\"value\":\"" + ladoDetectado + "\"},";
+  datos += "{\"host\":\"" + String(ZABBIX_HOST) + "\",\"key\":\"uptime\",\"value\":\"" + String(uptime) + "\"}";
+  datos += "]";
+  String request = "{\"request\":\"sender data\",\"data\":" + datos + "}";
+  uint32_t longitud = request.length();
+  uint8_t header[13];
+  header[0]='Z'; header[1]='B'; header[2]='X'; header[3]='D'; header[4]=0x01;
+  header[5]=longitud&0xFF; header[6]=(longitud>>8)&0xFF;
+  header[7]=(longitud>>16)&0xFF; header[8]=(longitud>>24)&0xFF;
+  header[9]=header[10]=header[11]=header[12]=0x00;
+  cliente.write(header, 13);
+  cliente.print(request);
+  cliente.flush();
+  unsigned long t = millis();
+  while (cliente.connected() && millis() - t < 3000) {
+    if (cliente.available()) {
+      Serial.println("Zabbix: " + cliente.readString());
+      break;
+    }
+    delay(50);
+  }
+  cliente.stop();
+}
+
+void conectarWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 10000) {
+    delay(300); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+  else
+    Serial.println("\nSin WiFi, reintentando.");
+}
+
+void avanzar()       { digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH); }
+void girarIzquierda(){ digitalWrite(IN1,LOW);  digitalWrite(IN2,LOW);  digitalWrite(IN3,LOW);  digitalWrite(IN4,HIGH); }
+void girarDerecha()  { digitalWrite(IN1,LOW);  digitalWrite(IN2,HIGH); digitalWrite(IN3,LOW);  digitalWrite(IN4,LOW);  }
+void detener()       { digitalWrite(IN1,LOW);  digitalWrite(IN2,LOW);  digitalWrite(IN3,LOW);  digitalWrite(IN4,LOW);  }
+void activarBomba()  { Serial.println("Bomba ON"); digitalWrite(BOMBA_PIN, HIGH); }
+void apagarBomba()   { digitalWrite(BOMBA_PIN, LOW); }
